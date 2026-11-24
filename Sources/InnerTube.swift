@@ -70,6 +70,8 @@ struct PlayerClient {
 /// Gọi API nội bộ của YouTube Music: tìm bài hát và lấy link âm thanh.
 final class InnerTube {
     static let shared = InnerTube()
+    /// Bật khi AVPlayer không mở được âm thanh AAC riêng: chuyển sang luồng ghép hình + tiếng (itag 18).
+    static var preferMuxed = false
 
     private let apiBase = "https://music.youtube.com/youtubei/v1/"
     private let webUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0"
@@ -539,10 +541,18 @@ final class InnerTube {
         }
 
         // 1) Âm thanh AAC (audio/mp4) có link trực tiếp: AVPlayer trên iOS 12 phát được.
-        let audio = all.filter { format in
+        let anyAudio = all.filter { format in
             guard let mime = format["mimeType"] as? String else { return false }
             return mime.hasPrefix("audio/mp4") && (format["url"] as? String) != nil
         }
+        // Ưu tiên AAC thường (mp4a), bỏ bản DRC / thuyết minh phụ; không còn thì dùng tất cả.
+        let cleanAudio = anyAudio.filter { format in
+            let mime = (format["mimeType"] as? String) ?? ""
+            let isDrc = (format["isDrc"] as? Bool) ?? false
+            let isDefaultTrack = ((format["audioTrack"] as? [String: Any])?["audioIsDefault"] as? Bool) ?? true
+            return mime.contains("mp4a") && !isDrc && isDefaultTrack
+        }
+        let audio = (InnerTube.preferMuxed) ? [] : (cleanAudio.isEmpty ? anyAudio : cleanAudio)
         let wantLow = AppSettings.audioQuality == .saver
         let chosen = wantLow
             ? audio.min(by: { bitrate($0) < bitrate($1) })

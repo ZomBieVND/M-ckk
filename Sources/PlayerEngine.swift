@@ -262,6 +262,8 @@ final class PlayerEngine: NSObject {
         let token = requestToken
         teardownPlayer()
         recoveries = 0
+        forceChunk = false
+        InnerTube.preferMuxed = false
         pendingSeek = 0
         isLoading = true
         isPlaying = false
@@ -286,7 +288,7 @@ final class PlayerEngine: NSObject {
             switch result {
             case .success(let info):
                 self.streamInfo = info
-                self.begin(url: info.url, headers: ["User-Agent": info.userAgent])
+                self.begin(url: info.url, headers: ["User-Agent": info.userAgent], stream: (info.unverified || self.forceChunk) ? info : nil)
             case .failure(let error):
                 self.fail(error)
             }
@@ -294,6 +296,7 @@ final class PlayerEngine: NSObject {
     }
 
     private var chunkLoader: ChunkedLoader?
+    private var forceChunk = false   // lần đầu lỗi khi phát trực tuyến: các lần thử lại dùng ChunkedLoader
 
     /// Vị trí phát chính xác (cập nhật từng khung hình), dùng cho lời chạy từng từ.
     var livePosition: Double {
@@ -380,7 +383,7 @@ final class PlayerEngine: NSObject {
             case .success(let info):
                 self.streamInfo = info
                 self.pendingSeek = resumeAt
-                self.begin(url: info.url, headers: ["User-Agent": info.userAgent])
+                self.begin(url: info.url, headers: ["User-Agent": info.userAgent], stream: (info.unverified || self.forceChunk) ? info : nil)
             case .failure(let error):
                 self.fail(error)
             }
@@ -455,6 +458,8 @@ final class PlayerEngine: NSObject {
             updateNowPlayingInfo()
         case .failed:
             let error: Error = item.error ?? MochyError.playback("AVPlayer báo lỗi không rõ")
+            if !isLocal && chunkLoader == nil { forceChunk = true }
+            if !isLocal && recoveries >= 1 { InnerTube.preferMuxed = true }
             if !recover() { fail(error) }
         default:
             break
@@ -483,11 +488,39 @@ final class PlayerEngine: NSObject {
         teardownPlayer()
         isLoading = false
         isPlaying = false
-        let message = describe(error)
+        var message = describe(error)
+        if !(error is MochyError), !isLocal, let info = streamInfo {
+            // Chẩn đoán: xin 32 byte đầu của luồng để biết máy chủ trả gì (HTTP mấy, có phải MP4 không).
+            message += "\n\n" + info.badge + " · " + info.mimeType + "\n" + probe(info)
+        }
         lastError = message
         postState()
         updateNowPlayingInfo()
         NotificationCenter.default.post(name: .playerFailed, object: nil, userInfo: ["message": message])
+    }
+
+    private func probe(_ info: StreamInfo) -> String {
+        var req = URLRequest(url: info.url)
+        req.timeoutInterval = 6
+        req.setValue(info.userAgent, forHTTPHeaderField: "User-Agent")
+        req.setValue("bytes=0-31", forHTTPHeaderField: "Range")
+        let sem = DispatchSemaphore(value: 0)
+        var out = "probe: lỗi mạng"
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            if let http = response as? HTTPURLResponse {
+                let bytes = data ?? Data()
+                let head = String(data: bytes.prefix(32), encoding: .isoLatin1) ?? ""
+                let hasFtyp = head.contains("ftyp")
+                let ctype = (http.allHeaderFields["Content-Type"] as? String) ?? "?"
+                out = "probe: HTTP \(http.statusCode), \(bytes.count) byte, ftyp=\(hasFtyp ? "có" : "KHÔNG"), \(ctype)"
+                if !hasFtyp { out += ", đầu: " + String(head.filter { $0.isASCII && !$0.isNewline }.prefix(40)) }
+            } else if let error = error {
+                out = "probe: \(error.localizedDescription)"
+            }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 7)
+        return out
     }
 
     private func describe(_ error: Error) -> String {
